@@ -114,7 +114,7 @@ class TransmissionBase(object):
         idle_limit_ok = None  # will remain if no idle limit defined
 
         if torrent.seedRatioMode == 1:  # use torrent's own seed ratio limit
-            seed_limit_ok = torrent.seedRatioLimit >= torrent.uploadRatio
+            seed_limit_ok = torrent.uploadRatio >= torrent.seedRatioLimit
         elif torrent.seedRatioMode == 0:  # use global rules
             if session.seedRatioLimited:
                 seed_limit_ok = torrent.uploadRatio >= session.seedRatioLimit
@@ -228,6 +228,7 @@ class PluginTransmission(TransmissionBase):
                 'properties': {
                     'host': {'type': 'string'},
                     'port': {'type': 'integer'},
+                    'netrc': {'type': 'string'},
                     'username': {'type': 'string'},
                     'password': {'type': 'string'},
                     'path': {'type': 'string'},   
@@ -357,7 +358,10 @@ class PluginTransmission(TransmissionBase):
         if 'include_subs' in opt_dic:
             post['include_subs'] = opt_dic['include_subs']
         if 'content_filename' in opt_dic:
-            post['content_filename'] = opt_dic['content_filename']
+            try:
+                post['content_filename'] = entry.render(opt_dic['content_filename'])
+            except RenderError as e:
+                log.error('Unable to render content_filename %s: %s' % (entry['title'], e))
         if 'skip_files' in opt_dic:
             post['skip_files'] = opt_dic['skip_files']
         if 'include_files' in opt_dic:
@@ -486,7 +490,7 @@ class PluginTransmission(TransmissionBase):
                                 counter = 1
                                 while os.path.exists(os.path.join(file_path, filename + file_ext)):
                                     # Try appending a (#) suffix till a unique filename is found
-                                    filename = ''.join(options['post']['content_filename'], '(', str(counter), ')')
+                                    filename = '%s(%s)' % (options['post']['content_filename'], counter)
                                     counter += 1
                             else:
                                 log.debug('Cannot ensure content_filename is unique '
@@ -497,10 +501,13 @@ class PluginTransmission(TransmissionBase):
                                 log.debug('File %s renamed to %s' % (fl[r.id][index]['name'], filename + file_ext))
                         # change to below when set_files will allow setting name, more efficient to have one call
                         # fl[r.id][index]['name'] = os.path.basename(pathscrub(filename + file_ext).encode('utf-8'))
-                                cli.rename_torrent_path(r.id, fl[r.id][index]['name'],
-                                                        os.path.basename(
-                                                        pathscrub(filename + file_ext).encode('utf-8'))
-                                                        )
+                                try:
+                                    cli.rename_torrent_path(r.id, fl[r.id][index]['name'],
+                                                            os.path.basename(
+                                                                pathscrub(filename + file_ext).encode('utf-8'))
+                                                            )
+                                except TransmissionError:
+                                    log.error('content_filename only supported with transmission 2.8+')
 
                         if ('main_file_only' in options['post'] and options['post']['main_file_only'] == True and
                            main_id is not None):

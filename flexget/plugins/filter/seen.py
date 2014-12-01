@@ -18,10 +18,10 @@ from sqlalchemy.schema import ForeignKey
 
 from flexget import db_schema, options, plugin
 from flexget.event import event
+from flexget.logger import console
 from flexget.manager import Session
 from flexget.utils.imdb import is_imdb_url, extract_id
 from flexget.utils.sqlalchemy_utils import table_schema, table_add_column
-from flexget.utils.tools import console
 
 log = logging.getLogger('seen')
 Base = db_schema.versioned_base('seen', 4)
@@ -270,12 +270,11 @@ def seen_add(options):
         if imdb_id:
             seen_name = imdb_id
 
-    session = Session()
-    se = SeenEntry(seen_name, 'cli_seen')
-    sf = SeenField('cli_seen', seen_name)
-    se.fields.append(sf)
-    session.add(se)
-    session.commit()
+    with Session() as session:
+        se = SeenEntry(seen_name, 'cli_seen')
+        sf = SeenField('cli_seen', seen_name)
+        se.fields.append(sf)
+        session.add(se)
     console('Added %s as seen. This will affect all tasks.' % seen_name)
 
 

@@ -1,4 +1,5 @@
-from __future__ import unicode_literals, division, absolute_import
+from __future__ import absolute_import, division, unicode_literals
+
 import logging
 import random
 import string
@@ -7,7 +8,8 @@ import threading
 import rpyc
 from rpyc.utils.server import ThreadedServer
 
-from flexget.utils.tools import BufferQueue, console
+from flexget.logger import console, capture_output
+from flexget.options import get_parser, ParserError
 
 log = logging.getLogger('ipc')
 
@@ -15,9 +17,39 @@ log = logging.getLogger('ipc')
 rpyc.core.protocol.DEFAULT_CONFIG['safe_attrs'].update(['items'])
 rpyc.core.protocol.DEFAULT_CONFIG['allow_pickle'] = True
 
-IPC_VERSION = 1
+IPC_VERSION = 3
 AUTH_ERROR = 'authentication error'
 AUTH_SUCCESS = 'authentication success'
+
+
+class RemoteStream(object):
+    """
+    Used as a filelike to stream text to remote client. If client disconnects while this is in use, an error will be
+    logged, but no exception raised.
+    """
+    def __init__(self, writer):
+        """
+        :param writer: A function which writes a line of text to remote client.
+        """
+        self.buffer = None
+        self.writer = writer
+
+    def write(self, data):
+        if not self.writer:
+            return
+        # This relies on all data up to a newline being either unicode or str, not mixed
+        if not self.buffer:
+            self.buffer = data
+        else:
+            self.buffer += data
+        newline = b'\n' if isinstance(self.buffer, str) else '\n'
+        while newline in self.buffer:
+            line, self.buffer = self.buffer.split(newline, 1)
+            try:
+                self.writer(line)
+            except EOFError:
+                self.writer = None
+                log.error('Client ended connection while still streaming output.')
 
 
 class DaemonService(rpyc.Service):
@@ -27,39 +59,28 @@ class DaemonService(rpyc.Service):
     def exposed_version(self):
         return IPC_VERSION
 
-    def exposed_execute(self, options=None):
-        # Dictionaries are pass by reference with rpyc, turn this into a real dict on our side
-        if options:
-            options = rpyc.utils.classic.obtain(options)
-        if len(self.manager.task_queue) > 0:
-            self.client_console('There is already a task executing. This task will execute next.')
-        log.info('Executing for client.')
-        cron = options and options.get('cron')
-        output = None if cron else BufferQueue()
-        tasks_finished = self.manager.execute(options=options, output=output)
-        if output:
-            # Send back any output until all tasks have finished
-            while any(not t.is_set() for t in tasks_finished) or output.qsize():
-                try:
-                    self.client_console(output.get(True, 0.5).rstrip())
-                except BufferQueue.Empty:
-                    continue
-
-    def exposed_reload(self):
+    def exposed_handle_cli(self, args):
+        args = rpyc.utils.classic.obtain(args)
+        parser = get_parser()
         try:
-            self.manager.load_config()
-        except ValueError as e:
-            self.client_console('Error loading config: %s' % e.args[0])
+            options = parser.parse_args(args, raise_errors=True)
+        except ParserError as e:
+            # Recreate the normal error text to the client's console
+            self.client_console('error: ' + e.message)
+            e.parser.print_help(self.client_out_stream)
+            return
+        if not options.cron:
+            with capture_output(self.client_out_stream, loglevel=options.loglevel):
+                self.manager.handle_cli(options)
         else:
-            self.client_console('Config successfully reloaded from disk.')
-
-    def exposed_shutdown(self, finish_queue=False):
-        log.info('Shutdown requested over ipc.')
-        self.client_console('Daemon shutdown requested.')
-        self.manager.shutdown(finish_queue=finish_queue)
+            self.manager.handle_cli(options)
 
     def client_console(self, text):
         self._conn.root.console(text)
+
+    @property
+    def client_out_stream(self):
+        return RemoteStream(self._conn.root.console)
 
 
 class ClientService(rpyc.Service):

@@ -1,23 +1,29 @@
-from __future__ import unicode_literals, division, absolute_import
+from __future__ import absolute_import, division, unicode_literals
+
 import copy
-import pkg_resources
 import random
 import socket
 import string
 import sys
-from argparse import (ArgumentParser as ArgParser, Action, ArgumentError, SUPPRESS, PARSER, REMAINDER, _VersionAction,
-                      Namespace, ArgumentTypeError)
+from argparse import ArgumentParser as ArgParser
+from argparse import _VersionAction, Action, ArgumentError, ArgumentTypeError, Namespace, PARSER, REMAINDER, SUPPRESS
+
+import pkg_resources
 
 import flexget
-from flexget.utils.tools import console
-from flexget.utils import requests
 from flexget.entry import Entry
 from flexget.event import fire_event
-
+from flexget.logger import console
+from flexget.utils import requests
 
 _UNSET = object()
 
 core_parser = None
+
+
+def unicode_argv():
+    """Like sys.argv, but decodes all arguments."""
+    return [arg.decode(sys.getfilesystemencoding()) for arg in sys.argv]
 
 
 def get_parser(command=None):
@@ -57,29 +63,21 @@ def required_length(nmin, nmax):
 
 
 class VersionAction(_VersionAction):
-    """
-    Action to print the current version.
-    Also attempts to get more information from git describe if on git checkout.
-    """
+    """Action to print the current version. Also checks latest release revision."""
     def __call__(self, parser, namespace, values, option_string=None):
-        self.version = flexget.__version__
         # Print the version number
         console('%s' % self.version)
-        if self.version == '{git}':
-            console('To check the latest released version you have run:')
-            console('`git fetch --tags` then `git describe`')
+        # Check for latest version from server
+        try:
+            page = requests.get('http://download.flexget.com/latestversion')
+        except requests.RequestException:
+            console('Error getting latest version number from download.flexget.com')
         else:
-            # Check for latest version from server
-            try:
-                page = requests.get('http://download.flexget.com/latestversion')
-            except requests.RequestException:
-                console('Error getting latest version number from download.flexget.com')
+            ver = page.text.strip()
+            if self.version == ver:
+                console('You are on the latest release.')
             else:
-                ver = page.text.strip()
-                if self.version == ver:
-                    console('You are on the latest release.')
-                else:
-                    console('Latest release: %s' % ver)
+                console('Latest release: %s' % ver)
         parser.exit()
 
 
@@ -210,7 +208,7 @@ class ArgumentParser(ArgParser):
             this attribute name in the root parser's namespace
         """
         # Do this early, so even option processing stuff is caught
-        if '--bugreport' in sys.argv:
+        if '--bugreport' in unicode_argv():
             self._debug_tb_callback()
 
         self.subparsers = None
@@ -278,7 +276,7 @@ class ArgumentParser(ArgParser):
     def parse_known_args(self, args=None, namespace=None):
         if args is None:
             # Decode all arguments to unicode before parsing
-            args = [unicode(arg, sys.getfilesystemencoding()) for arg in sys.argv[1:]]
+            args = unicode_argv()[1:]
         # Remove all of our defaults, to give subparsers and custom actions first priority at setting them
         self.stash_defaults()
         try:
@@ -339,7 +337,8 @@ class ArgumentParser(ArgParser):
 
 # This will hold just the arguments directly for Manager. Webui needs this clean, to build its parser.
 manager_parser = ArgumentParser(add_help=False)
-manager_parser.add_argument('-V', '--version', action=VersionAction, help='Print FlexGet version and exit.')
+manager_parser.add_argument('-V', '--version', action=VersionAction, version=flexget.__version__,
+                            help='Print FlexGet version and exit.')
 manager_parser.add_argument('--test', action='store_true', dest='test', default=0,
                             help='Verbose what would happen on normal execution.')
 manager_parser.add_argument('-c', dest='config', default='config.yml',
@@ -362,6 +361,9 @@ manager_parser.add_argument('--debug-trace', action=DebugTraceAction, nargs=0, h
 manager_parser.add_argument('--debug-sql', action='store_true', default=False, help=SUPPRESS)
 manager_parser.add_argument('--experimental', action='store_true', default=False, help=SUPPRESS)
 manager_parser.add_argument('--ipc-port', type=int, help=SUPPRESS)
+manager_parser.add_argument('--cron', action=CronAction, default=False, nargs=0,
+                            help='use when executing FlexGet non-interactively: allows background '
+                                 'maintenance to run, disables stdout and stderr output, reduces logging level')
 
 
 class CoreArgumentParser(ArgumentParser):
@@ -384,9 +386,6 @@ class CoreArgumentParser(ArgumentParser):
                                       'matching is case-insensitive')
         exec_parser.add_argument('--learn', action='store_true', dest='learn', default=False,
                                  help='matches are not downloaded but will be skipped in the future')
-        exec_parser.add_argument('--cron', action=CronAction, default=False, nargs=0,
-                                 help='use when scheduling FlexGet with cron or other scheduler: allows background '
-                                      'maintenance to run, disables stdout and stderr output, reduces logging level')
         exec_parser.add_argument('--profile', action='store_true', default=False, help=SUPPRESS)
         exec_parser.add_argument('--disable-phases', nargs='*', help=SUPPRESS)
         exec_parser.add_argument('--inject', nargs='+', action=InjectAction, help=SUPPRESS)
@@ -405,7 +404,9 @@ class CoreArgumentParser(ArgumentParser):
         daemon_parser.add_subparsers(title='actions', metavar='<action>', dest='action')
         start_parser = daemon_parser.add_subparser('start', help='start the daemon')
         start_parser.add_argument('-d', '--daemonize', action='store_true', help=daemonize_help)
-        daemon_parser.add_subparser('stop', help='shutdown the running daemon')
+        stop_parser = daemon_parser.add_subparser('stop', help='shutdown the running daemon')
+        stop_parser.add_argument('--wait', action='store_true',
+                                 help='wait for all queued tasks to finish before stopping daemon')
         daemon_parser.add_subparser('status', help='check if a daemon is running')
         daemon_parser.add_subparser('reload', help='causes a running daemon to reload the config from disk')
         daemon_parser.set_defaults(loglevel='info')
