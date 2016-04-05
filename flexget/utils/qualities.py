@@ -119,9 +119,9 @@ _resolutions = [
     QualityComponent('resolution', 40, '576p', '576p?'),
     QualityComponent('resolution', 45, 'hr'),
     QualityComponent('resolution', 50, '720i'),
-    QualityComponent('resolution', 60, '720p', '(1280x)?720p?x?(50)?'),
+    QualityComponent('resolution', 60, '720p', '(1280x)?720(p|hd)?x?(50)?'),
     QualityComponent('resolution', 70, '1080i'),
-    QualityComponent('resolution', 80, '1080p', '(1920x)?1080p?')
+    QualityComponent('resolution', 80, '1080p', '(1920x)?1080p?x?(50)?')
 ]
 _sources = [
     QualityComponent('source', 10, 'workprint', modifier=-8),
@@ -148,7 +148,8 @@ _codecs = [
     QualityComponent('codec', 10, 'divx'),
     QualityComponent('codec', 20, 'xvid'),
     QualityComponent('codec', 30, 'h264', '[hx].?264'),
-    QualityComponent('codec', 40, '10bit', '10.?bit|hi10p')
+    QualityComponent('codec', 40, 'h265', '[hx].?265|hevc'),
+    QualityComponent('codec', 50, '10bit', '10.?bit|hi10p')
 ]
 channels = '(?:(?:[\W_]?5[\W_]?1)|(?:[\W_]?2[\W_]?(?:0|ch)))'
 _audios = [

@@ -5,14 +5,14 @@ import re
 from flexget import plugin
 from flexget.event import event
 from flexget.plugins.plugin_urlrewriting import UrlRewritingError
-from flexget.utils.requests import Session
+from flexget.utils.requests import Session, TimedLimiter
 from flexget.utils.soup import get_soup
 
 log = logging.getLogger('newpct')
 
 requests = Session()
 requests.headers.update({'User-Agent': 'Mozilla/4.0 (compatible; MSIE 5.5; Windows NT)'})
-requests.set_domain_delay('imdb.com', '2 seconds')
+requests.add_domain_limiter(TimedLimiter('imdb.com', '2 seconds'))
 
 
 class UrlRewriteNewPCT(object):
@@ -21,8 +21,8 @@ class UrlRewriteNewPCT(object):
     # urlrewriter API
     def url_rewritable(self, task, entry):
         url = entry['url']
-        rewritable_regex='^http:\/\/(www.)?newpct1?.com\/.*'
-        return re.match(rewritable_regex,url) and not url.startswith('http://www.newpct.com/descargar/')
+        rewritable_regex = '^http:\/\/(www.)?newpct1?.com\/.*'
+        return re.match(rewritable_regex, url) and not url.startswith('http://www.newpct.com/descargar/')
 
     # urlrewriter API
     def url_rewrite(self, task, entry):
@@ -41,6 +41,7 @@ class UrlRewriteNewPCT(object):
             raise UrlRewritingError('Unable to locate torrent ID from url %s' % url)
         torrent_id = torrent_id_prog.search(torrent_ids[0]).group(1)
         return 'http://www.newpct.com/descargar/torrent/%s/dummy.html' % torrent_id
+
 
 @event('plugin.register')
 def register_plugin():

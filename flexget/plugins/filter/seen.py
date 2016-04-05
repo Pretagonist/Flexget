@@ -9,18 +9,20 @@ forget (string)
 """
 
 from __future__ import unicode_literals, division, absolute_import
+
 import logging
 from datetime import datetime, timedelta
+from types import NoneType
 
 from sqlalchemy import Column, Integer, DateTime, Unicode, Boolean, or_, select, update, Index
 from sqlalchemy.orm import relation
 from sqlalchemy.schema import ForeignKey
 
-from flexget import db_schema, options, plugin
+from flexget import db_schema, plugin
 from flexget.event import event
-from flexget.logger import console
 from flexget.manager import Session
-from flexget.utils.imdb import is_imdb_url, extract_id
+from flexget.utils.database import with_session
+from flexget.utils.imdb import extract_id
 from flexget.utils.sqlalchemy_utils import table_schema, table_add_column
 
 log = logging.getLogger('seen')
@@ -56,7 +58,6 @@ def upgrade(ver, session):
 
 
 class SeenEntry(Base):
-
     __tablename__ = 'seen_entry'
 
     id = Column(Integer, primary_key=True)
@@ -68,7 +69,9 @@ class SeenEntry(Base):
 
     fields = relation('SeenField', backref='seen_entry', cascade='all, delete, delete-orphan')
 
-    def __init__(self, title, task, reason=None, local=False):
+    def __init__(self, title, task, reason=None, local=None):
+        if local is None:
+            local = False
         self.title = title
         self.reason = reason
         self.task = task
@@ -78,9 +81,24 @@ class SeenEntry(Base):
     def __str__(self):
         return '<SeenEntry(title=%s,reason=%s,task=%s,added=%s)>' % (self.title, self.reason, self.task, self.added)
 
+    def to_dict(self):
+        fields = []
+        for field in self.fields:
+            fields.append(field.to_dict())
+
+        seen_entry_object = {
+            'id': self.id,
+            'title': self.title,
+            'reason': self.reason,
+            'task': self.task,
+            'added': self.added,
+            'local': self.local,
+            'fields': fields
+        }
+        return seen_entry_object
+
 
 class SeenField(Base):
-
     __tablename__ = 'seen_field'
 
     id = Column(Integer, primary_key=True)
@@ -97,6 +115,15 @@ class SeenField(Base):
     def __str__(self):
         return '<SeenField(field=%s,value=%s,added=%s)>' % (self.field, self.value, self.added)
 
+    def to_dict(self):
+        return {
+            'field_name': self.field,
+            'field_id': self.id,
+            'value': self.value,
+            'added': self.added,
+            'seen_entry_id': self.seen_entry_id
+        }
+
 
 @event('forget')
 def forget(value):
@@ -106,9 +133,7 @@ def forget(value):
     :return: count, field_count where count is number of entries removed and field_count number of fields
     """
     log.debug('forget called with %s' % value)
-    session = Session()
-
-    try:
+    with Session() as session:
         count = 0
         field_count = 0
         for se in session.query(SeenEntry).filter(or_(SeenEntry.title == value, SeenEntry.task == value)).all():
@@ -124,9 +149,39 @@ def forget(value):
             log.debug('forgetting %s' % se)
             session.delete(se)
         return count, field_count
-    finally:
-        session.commit()
-        session.close()
+
+
+@with_session
+def forget_by_id(entry_id, session=None):
+    """
+    Delete SeenEntry via its ID
+    :param entry_id: SeenEntry ID
+    :param session: DB Session
+    """
+    entry = session.query(SeenEntry).filter(SeenEntry.id == entry_id).first()
+    if not entry:
+        raise ValueError('Could not find entry with ID {0}'.format(entry_id))
+    log.debug('Deleting seen entry with ID {0}'.format(entry_id))
+    session.delete(entry)
+
+
+@with_session
+def search_by_field_values(field_value_list, task_name, local=False, session=None):
+    """
+    Return a SeenEntry instance if it matches field values
+    :param field_value_list: List of field values to match
+    :param task_name: Name of task to compare to in case local flag is sent
+    :param local: Local flag
+    :param session: Current session
+    :return: SeenEntry Object or None
+    """
+    found = session.query(SeenField).join(SeenEntry).filter(SeenField.value.in_(field_value_list))
+    if local:
+        found = found.filter(SeenEntry.task == task_name)
+    else:
+        # Entries added from CLI were having local marked as None rather than False for a while gh#879
+        found = found.filter(or_(SeenEntry.local == False, SeenEntry.local == None))
+    return found.first()
 
 
 class FilterSeen(object):
@@ -138,28 +193,51 @@ class FilterSeen(object):
         This plugin is enabled on all tasks by default.
         See wiki for more information.
     """
+    schema = {
+        'oneOf': [
+            {'type': 'boolean'},
+            {'type': 'string', 'enum': ['global', 'local']},
+            {'type': 'object',
+             'properties': {
+                 'local': {'type': 'boolean'},
+                 'fields': {'type': 'array',
+                            'items': {'type': 'string'},
+                            "minItems": 1,
+                            "uniqueItems": True}
+             }}
+        ]
+    }
 
     def __init__(self):
         # remember and filter by these fields
         self.fields = ['title', 'url', 'original_url']
         self.keyword = 'seen'
 
-    def validator(self):
-        from flexget import validator
-        root = validator.factory()
-        root.accept('boolean')
-        root.accept('choice').accept_choices(['global', 'local'])
-        return root
+    def prepare_config(self, config):
+        if isinstance(config, NoneType):
+            config = {}
+        elif isinstance(config, bool):
+            if config is False:
+                return config
+            else:
+                config = {'local': config}
+        elif isinstance(config, basestring):
+            config = {'local': config}
+
+        config.setdefault('local', 'global')
+        config.setdefault('fields', self.fields)
+        return config
 
     @plugin.priority(255)
     def on_task_filter(self, task, config, remember_rejected=False):
-        """Filter seen entries"""
+        """Filter entries already accepted on previous runs."""
+        config = self.prepare_config(config)
         if config is False:
             log.debug('%s is disabled' % self.keyword)
             return
 
-        fields = self.fields
-        local = config == 'local'
+        fields = config.get('fields')
+        local = config.get('local') == 'local'
 
         for entry in task.entries:
             # construct list of values looked
@@ -172,12 +250,8 @@ class FilterSeen(object):
             if values:
                 log.trace('querying for: %s' % ', '.join(values))
                 # check if SeenField.value is any of the values
-                found = task.session.query(SeenField).join(SeenEntry).filter(SeenField.value.in_(values))
-                if local:
-                    found = found.filter(SeenEntry.task == task.name)
-                else:
-                    found = found.filter(SeenEntry.local == False)
-                found = found.first()
+                found = search_by_field_values(field_value_list=values, task_name=task.name, local=local,
+                                               session=task.session)
                 if found:
                     log.debug("Rejecting '%s' '%s' because of seen '%s'" % (entry['url'], entry['title'], found.value))
                     se = task.session.query(SeenEntry).filter(SeenEntry.id == found.seen_entry_id).one()
@@ -187,16 +261,19 @@ class FilterSeen(object):
 
     def on_task_learn(self, task, config):
         """Remember succeeded entries"""
+        config = self.prepare_config(config)
         if config is False:
             log.debug('disabled')
             return
 
-        fields = self.fields
+        fields = config.get('fields')
+        local = config.get('local') == 'local'
+
         if isinstance(config, list):
             fields.extend(config)
 
         for entry in task.accepted:
-            self.learn(task, entry, fields=fields, local=config == 'local')
+            self.learn(task, entry, fields=fields, local=local)
             # verbose if in learning mode
             if task.options.learn:
                 log.info("Learned '%s' (will skip this in the future)" % (entry['title']))
@@ -209,7 +286,7 @@ class FilterSeen(object):
         se = SeenEntry(entry['title'], unicode(task.name), reason, local)
         remembered = []
         for field in fields:
-            if not field in entry:
+            if field not in entry:
                 continue
             # removes duplicate values (eg. url, original_url are usually same)
             if entry[field] in remembered:
@@ -232,7 +309,7 @@ class FilterSeen(object):
 
 
 @event('manager.db_cleanup')
-def db_cleanup(session):
+def db_cleanup(manager, session):
     log.debug('TODO: Disabled because of ticket #1321')
     return
 
@@ -242,74 +319,42 @@ def db_cleanup(session):
         log.verbose('Removed %d seen fields older than 1 year.' % result)
 
 
-def do_cli(manager, options):
-    if options.seen_action == 'forget':
-        seen_forget(manager, options)
-    elif options.seen_action == 'add':
-        seen_add(options)
-    elif options.seen_action == 'search':
-        seen_search(options)
-
-
-def seen_forget(manager, options):
-    forget_name = options.forget_value
-    if is_imdb_url(forget_name):
-        imdb_id = extract_id(forget_name)
-        if imdb_id:
-            forget_name = imdb_id
-
-    count, fcount = forget(forget_name)
-    console('Removed %s titles (%s fields)' % (count, fcount))
-    manager.config_changed()
-
-
-def seen_add(options):
-    seen_name = options.add_value
-    if is_imdb_url(seen_name):
-        imdb_id = extract_id(seen_name)
-        if imdb_id:
-            seen_name = imdb_id
-
-    with Session() as session:
-        se = SeenEntry(seen_name, 'cli_seen')
-        sf = SeenField('cli_seen', seen_name)
+@with_session
+def add(title, task_name, fields, reason=None, local=None, session=None):
+    """
+    Adds seen entries to DB
+    :param title: name of title to be added
+    :param task_name: name of task to be added
+    :param fields: Dict of fields to be added to seen object
+    :return: Seen Entry object as committed to DB
+    """
+    se = SeenEntry(title, task_name, reason, local)
+    for field, value in fields.items():
+        sf = SeenField(field, value)
         se.fields.append(sf)
-        session.add(se)
-    console('Added %s as seen. This will affect all tasks.' % seen_name)
+    session.add(se)
+    session.commit()
+    return se.to_dict()
 
 
-def seen_search(options):
-    session = Session()
-    try:
-        search_term = '%' + options.search_term + '%'
-        seen_entries = (session.query(SeenEntry).join(SeenField).
-                        filter(SeenField.value.like(search_term)).order_by(SeenField.added).all())
-
-        for se in seen_entries:
-            console('ID: %s Name: %s Task: %s Added: %s' % (se.id, se.title, se.task, se.added.strftime('%c')))
-            for sf in se.fields:
-                console(' %s: %s' % (sf.field, sf.value))
-            console('')
-
-        if not seen_entries:
-            console('No results')
-    finally:
-        session.close()
+@with_session
+def search(value=None, status=None, start=None, stop=None, count=False, order_by='added', descending=False, session=None):
+    query = session.query(SeenEntry)
+    if descending:
+        query = query.order_by(getattr(SeenEntry, order_by).desc())
+    else:
+        query = query.order_by(getattr(SeenEntry, order_by))
+    query = query.join(SeenField)
+    if value:
+        query = query.filter(SeenField.value.like(value))
+    if status is not None:
+        query = query.filter(SeenEntry.local == status)
+    if count:
+        return query.count()
+    query = query.slice(start, stop).from_self()
+    return query
 
 
 @event('plugin.register')
 def register_plugin():
     plugin.register(FilterSeen, 'seen', builtin=True, api_ver=2)
-
-
-@event('options.register')
-def register_parser_arguments():
-    parser = options.register_command('seen', do_cli, help='view or forget entries remembered by the seen plugin')
-    subparsers = parser.add_subparsers(dest='seen_action', metavar='<action>')
-    forget_parser = subparsers.add_parser('forget', help='forget entry or entire task from seen plugin database')
-    forget_parser.add_argument('forget_value', metavar='<value>',
-                               help='title or url of entry to forget, or name of task to forget')
-    add_parser = subparsers.add_parser('add', help='add a title or url to the seen database')
-    add_parser.add_argument('add_value', metavar='<value>', help='the title or url to add')
-    search_parser = subparsers.add_parser('search', help='search text from the seen database')
-    search_parser.add_argument('search_term', metavar='<search term>')

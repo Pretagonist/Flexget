@@ -1,4 +1,5 @@
 from __future__ import absolute_import, division, unicode_literals, print_function
+import collections
 import contextlib
 import logging
 import logging.handlers
@@ -7,6 +8,13 @@ import threading
 import uuid
 import warnings
 
+# Support order in python 2.7 and 3
+try:
+    from collections import OrderedDict
+except ImportError:
+    pass
+
+from flexget import __version__
 from flexget.utils.tools import io_encoding
 
 # A level more detailed than DEBUG
@@ -53,7 +61,7 @@ def capture_output(stream, loglevel=None):
     # Keep using current, or create one if none already set
     local_context.session_id = old_id or uuid.uuid4()
     old_output = getattr(local_context, 'output', None)
-    local_context.output = stream
+    old_loglevel = getattr(local_context, 'loglevel', None)
     streamhandler = logging.StreamHandler(stream)
     streamhandler.setFormatter(FlexGetFormatter())
     streamhandler.addFilter(SessionFilter(local_context.session_id))
@@ -64,6 +72,8 @@ def capture_output(stream, loglevel=None):
         # All existing handlers should have their desired level set and not be affected.
         if not root_logger.isEnabledFor(loglevel):
             root_logger.setLevel(loglevel)
+    local_context.output = stream
+    local_context.loglevel = loglevel
     root_logger.addHandler(streamhandler)
     try:
         yield
@@ -72,24 +82,39 @@ def capture_output(stream, loglevel=None):
         root_logger.setLevel(old_level)
         local_context.session_id = old_id
         local_context.output = old_output
+        local_context.loglevel = old_loglevel
 
 
-def get_output():
+def get_capture_stream():
     """If output is currently being redirected to a stream, returns that stream."""
     return getattr(local_context, 'output', None)
 
 
-def console(text):
+def get_capture_loglevel():
+    """If output is currently being redirected to a stream, returns declared loglevel for that stream."""
+    return getattr(local_context, 'loglevel', None)
+
+
+def console(text, *args, **kwargs):
     """
     Print to console safely. Output is able to be captured by different streams in different contexts.
 
     Any plugin wishing to output to the user's console should use this function instead of print so that
     output can be redirected when FlexGet is invoked from another process.
+
+    Accepts arguments like the `print` function does.
     """
     if not isinstance(text, str):
         text = unicode(text).encode(io_encoding, 'replace')
-    output = getattr(local_context, 'output', sys.stdout)
-    print(text, file=output)
+    kwargs['file'] = getattr(local_context, 'output', sys.stdout)
+    print(text, *args, **kwargs)
+    kwargs['file'].flush()  # flush to make sure the output is printed right away
+
+
+class RollingBuffer(collections.deque):
+    """File-like that keeps a certain number of lines of text in memory."""
+    def write(self, line):
+        self.append(line)
 
 
 class FlexGetLogger(logging.Logger):
@@ -130,6 +155,8 @@ class FlexGetFormatter(logging.Formatter):
 _logging_configured = False
 _buff_handler = None
 _logging_started = False
+# Stores the last 50 debug messages
+debug_buffer = RollingBuffer(maxlen=50)
 
 
 def initialize(unit_test=False):
@@ -140,14 +167,15 @@ def initialize(unit_test=False):
     if _logging_configured:
         return
 
-    warnings.simplefilter('once')
+    if 'dev' in __version__:
+        warnings.filterwarnings('always', category=DeprecationWarning, module='flexget.*')
+    warnings.simplefilter('once', append=True)
     logging.addLevelName(TRACE, 'TRACE')
     logging.addLevelName(VERBOSE, 'VERBOSE')
     _logging_configured = True
 
-    # with unit test we want a bit simpler setup
+    # with unit test we want pytest to add the handlers
     if unit_test:
-        logging.basicConfig()
         _logging_started = True
         return
 
@@ -156,6 +184,12 @@ def initialize(unit_test=False):
     _buff_handler = logging.handlers.BufferingHandler(1000 * 1000)
     logger.addHandler(_buff_handler)
     logger.setLevel(logging.NOTSET)
+
+    # Add a handler that sores the last 50 debug lines to `debug_buffer` for use in crash reports
+    crash_handler = logging.StreamHandler(debug_buffer)
+    crash_handler.setLevel(logging.DEBUG)
+    crash_handler.setFormatter(FlexGetFormatter())
+    logger.addHandler(crash_handler)
 
 
 def start(filename=None, level=logging.INFO, to_console=True, to_file=True):

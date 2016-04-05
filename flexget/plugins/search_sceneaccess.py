@@ -10,11 +10,9 @@ from flexget.entry import Entry
 from flexget.event import event
 from flexget.utils.soup import get_soup
 from flexget.utils.search import torrent_availability, normalize_unicode, clean_title
-from flexget.utils.requests import Session
+from flexget.utils.requests import TimedLimiter
 
 log = logging.getLogger('search_sceneaccess')
-
-session = Session()
 
 CATEGORIES = {
     'browse':
@@ -77,6 +75,7 @@ CATEGORIES = {
 }
 
 URL = 'https://sceneaccess.eu/'
+
 
 class SceneAccessSearch(object):
     """ Scene Access Search plugin
@@ -228,10 +227,15 @@ class SceneAccessSearch(object):
             return ret
 
     @plugin.internet(log)
-    def search(self, entry, config=None):
+    def search(self, task, entry, config=None):
         """
             Search for entries on SceneAccess
         """
+
+        session = task.requests
+
+        if 'sceneaccess.eu' not in session.domain_limiters:
+            session.add_domain_limiter(TimedLimiter('sceneaccess.eu', '7 seconds'))
 
         if not session.cookies:
             log.debug('Logging in to %s...' % URL)
@@ -240,7 +244,7 @@ class SceneAccessSearch(object):
                       'submit': 'come on in'}
             session.post(URL + 'login', data=params)
 
-        if config.has_key('gravity_multiplier'):
+        if 'gravity_multiplier' in config:
             multip = config['gravity_multiplier']
         else:
             multip = 1
@@ -270,7 +274,8 @@ class SceneAccessSearch(object):
 
                     entry['torrent_seeds'] = result.find('td', attrs={'class': 'ttr_seeders'}).text
                     entry['torrent_leeches'] = result.find('td', attrs={'class': 'ttr_leechers'}).text
-                    entry['search_sort'] = torrent_availability(entry['torrent_seeds'], entry['torrent_leeches'])*multip
+                    entry['search_sort'] = torrent_availability(entry['torrent_seeds'],
+                                                                entry['torrent_leeches']) * multip
 
                     size = result.find('td', attrs={'class': 'ttr_size'}).next
                     size = re.search('(\d+(?:[.,]\d+)*)\s?([KMG]B)', size)
@@ -288,6 +293,7 @@ class SceneAccessSearch(object):
                     entries.add(entry)
 
         return entries
+
 
 @event('plugin.register')
 def register_plugin():

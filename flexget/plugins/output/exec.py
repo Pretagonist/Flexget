@@ -1,44 +1,30 @@
 from __future__ import unicode_literals, division, absolute_import
-from collections import MutableMapping
 import logging
 import subprocess
 
 
 from flexget import plugin
+from flexget.entry import Entry
 from flexget.event import event
+from flexget.config_schema import one_or_more
 from flexget.utils.template import render_from_entry, render_from_task, RenderError
 from flexget.utils.tools import io_encoding
 
 log = logging.getLogger('exec')
 
 
-class EscapingDict(MutableMapping):
-    """Helper class, same as a dict, but returns all string value with quotes escaped."""
+class EscapingEntry(Entry):
+    """Helper class, same as a Entry, but returns all string value with quotes escaped."""
 
-    def __init__(self, mapping):
-        self._data = mapping
-
-    def __len__(self):
-        return len(self._data)
-
-    def __iter__(self):
-        return iter(self._data)
+    def __init__(self, entry):
+        super(EscapingEntry, self).__init__(entry)
 
     def __getitem__(self, key):
-        value = self._data[key]
+        value = super(EscapingEntry, self).__getitem__(key)
+        # TODO: May need to be different depending on OS
         if isinstance(value, basestring):
-            # TODO: May need to be different depending on OS
             value = value.replace('"', '\\"')
         return value
-
-    def __setitem__(self, key, value):
-        self._data[key] = value
-
-    def __delitem__(self, key):
-        del self._data[key]
-
-    def __copy__(self):
-        return EscapingDict(self._data.copy())
 
 
 class PluginExec(object):
@@ -67,7 +53,7 @@ class PluginExec(object):
 
     schema = {
         'oneOf': [
-            {'type': 'string'},
+            one_or_more({'type': 'string'}),
             {
                 'type': 'object',
                 'properties': {
@@ -88,11 +74,11 @@ class PluginExec(object):
             'phaseSettings': {
                 'type': 'object',
                 'properties': {
-                    'phase': {'type': 'string'},
-                    'for_entries': {'type': 'string'},
-                    'for_accepted': {'type': 'string'},
-                    'for_rejected': {'type': 'string'},
-                    'for_failed': {'type': 'string'}
+                    'phase': one_or_more({'type': 'string'}),
+                    'for_entries': one_or_more({'type': 'string'}),
+                    'for_accepted': one_or_more({'type': 'string'}),
+                    'for_rejected': one_or_more({'type': 'string'}),
+                    'for_failed': one_or_more({'type': 'string'})
                 },
                 'additionalProperties': False
             }
@@ -101,9 +87,17 @@ class PluginExec(object):
 
     def prepare_config(self, config):
         if isinstance(config, basestring):
+            config = [config]
+        if isinstance(config, list):
             config = {'on_output': {'for_accepted': config}}
         if not config.get('encoding'):
             config['encoding'] = io_encoding
+        for phase_name in config:
+            if phase_name.startswith('on_'):
+                for items_name in config[phase_name]:
+                    if isinstance(config[phase_name][items_name], basestring):
+                        config[phase_name][items_name] = [config[phase_name][items_name]]
+
         return config
 
     def execute_cmd(self, cmd, allow_background, encoding):
@@ -121,7 +115,7 @@ class PluginExec(object):
 
     def execute(self, task, phase_name, config):
         config = self.prepare_config(config)
-        if not phase_name in config:
+        if phase_name not in config:
             log.debug('phase %s not configured' % phase_name)
             return
 
@@ -130,54 +124,56 @@ class PluginExec(object):
 
         allow_background = config.get('allow_background')
         for operation, entries in name_map.iteritems():
-            if not operation in config[phase_name]:
+            if operation not in config[phase_name]:
                 continue
 
             log.debug('running phase_name: %s operation: %s entries: %s' % (phase_name, operation, len(entries)))
 
             for entry in entries:
-                cmd = config[phase_name][operation]
-                entrydict = EscapingDict(entry) if config.get('auto_escape') else entry
-                # Do string replacement from entry, but make sure quotes get escaped
-                try:
-                    cmd = render_from_entry(cmd, entrydict)
-                except RenderError as e:
-                    log.error('Could not set exec command for %s: %s' % (entry['title'], e))
-                    # fail the entry if configured to do so
-                    if config.get('fail_entries'):
-                        entry.fail('Entry `%s` does not have required fields for string replacement.' % entry['title'])
-                    continue
-
-                log.debug('phase_name: %s operation: %s cmd: %s' % (phase_name, operation, cmd))
-                if task.options.test:
-                    log.info('Would execute: %s' % cmd)
-                else:
-                    # Make sure the command can be encoded into appropriate encoding, don't actually encode yet,
-                    # so logging continues to work.
+                for cmd in config[phase_name][operation]:
+                    entrydict = EscapingEntry(entry) if config.get('auto_escape') else entry
+                    # Do string replacement from entry, but make sure quotes get escaped
                     try:
-                        cmd.encode(config['encoding'])
-                    except UnicodeEncodeError:
-                        log.error('Unable to encode cmd `%s` to %s' % (cmd, config['encoding']))
+                        cmd = render_from_entry(cmd, entrydict)
+                    except RenderError as e:
+                        log.error('Could not set exec command for %s: %s' % (entry['title'], e))
+                        # fail the entry if configured to do so
                         if config.get('fail_entries'):
-                            entry.fail('cmd `%s` could not be encoded to %s.' % (cmd, config['encoding']))
+                            entry.fail('Entry `%s` does not have required fields for string replacement.' %
+                                       entry['title'])
                         continue
-                    # Run the command, fail entries with non-zero return code if configured to
-                    if self.execute_cmd(cmd, allow_background, config['encoding']) != 0 and config.get('fail_entries'):
-                        entry.fail('exec return code was non-zero')
+
+                    log.debug('phase_name: %s operation: %s cmd: %s' % (phase_name, operation, cmd))
+                    if task.options.test:
+                        log.info('Would execute: %s' % cmd)
+                    else:
+                        # Make sure the command can be encoded into appropriate encoding, don't actually encode yet,
+                        # so logging continues to work.
+                        try:
+                            cmd.encode(config['encoding'])
+                        except UnicodeEncodeError:
+                            log.error('Unable to encode cmd `%s` to %s' % (cmd, config['encoding']))
+                            if config.get('fail_entries'):
+                                entry.fail('cmd `%s` could not be encoded to %s.' % (cmd, config['encoding']))
+                            continue
+                        # Run the command, fail entries with non-zero return code if configured to
+                        if (self.execute_cmd(cmd, allow_background, config['encoding']) != 0 and
+                                config.get('fail_entries')):
+                            entry.fail('exec return code was non-zero')
 
         # phase keyword in this
         if 'phase' in config[phase_name]:
-            cmd = config[phase_name]['phase']
-            try:
-                cmd = render_from_task(cmd, task)
-            except RenderError as e:
-                log.error('Error rendering `%s`: %s' % (cmd, e))
-            else:
-                log.debug('phase cmd: %s' % cmd)
-                if task.options.test:
-                    log.info('Would execute: %s' % cmd)
+            for cmd in config[phase_name]['phase']:
+                try:
+                    cmd = render_from_task(cmd, task)
+                except RenderError as e:
+                    log.error('Error rendering `%s`: %s' % (cmd, e))
                 else:
-                    self.execute_cmd(cmd, allow_background, config['encoding'])
+                    log.debug('phase cmd: %s' % cmd)
+                    if task.options.test:
+                        log.info('Would execute: %s' % cmd)
+                    else:
+                        self.execute_cmd(cmd, allow_background, config['encoding'])
 
     def __getattr__(self, item):
         """Creates methods to handle task phases."""

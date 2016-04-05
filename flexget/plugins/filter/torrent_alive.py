@@ -1,4 +1,5 @@
 from __future__ import unicode_literals, division, absolute_import
+import itertools
 import logging
 import threading
 import socket
@@ -18,9 +19,10 @@ log = logging.getLogger('torrent_alive')
 
 
 class TorrentAliveThread(threading.Thread):
+    _counter = itertools.count().next
 
     def __init__(self, tracker, info_hash):
-        threading.Thread.__init__(self)
+        threading.Thread.__init__(self, name='torrent_alive-%d' % self._counter())
         self.tracker = tracker
         self.info_hash = info_hash
         self.tracker_seeds = 0
@@ -97,7 +99,7 @@ def get_udp_seeds(url, info_hash):
         # check recieved packet for response
         action, transaction_id, connection_id = struct.unpack(b">LLQ", res)
 
-        #build packet hash out of decoded info_hash
+        # build packet hash out of decoded info_hash
         packet_hash = info_hash.decode('hex')
 
         # construct packet for scrape with decoded info_hash setting action byte to 2 for scape

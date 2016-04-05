@@ -1,12 +1,12 @@
 from __future__ import unicode_literals, division, absolute_import
 import logging
-import hashlib
 
 from requests import RequestException
 
 from flexget import plugin
 from flexget.event import event
 from flexget.utils import json
+from flexget.plugins.api_trakt import get_api_url, get_entry_ids, get_session, make_list_slug
 
 
 class TraktSubmit(object):
@@ -15,11 +15,11 @@ class TraktSubmit(object):
         'type': 'object',
         'properties': {
             'username': {'type': 'string'},
-            'password': {'type': 'string'},
-            'api_key': {'type': 'string'},
-            'list': {'type': 'string'}
+            'account': {'type': 'string'},
+            'list': {'type': 'string'},
+            'type': {'type': 'string', 'enum': ['shows', 'seasons', 'episodes', 'movies', 'auto'], 'default': 'auto'}
         },
-        'required': ['username', 'password', 'api_key', 'list'],
+        'required': ['list', 'account'],
         'additionalProperties': False
     }
 
@@ -27,128 +27,81 @@ class TraktSubmit(object):
     remove = None
     log = None
 
-    def submit_data(self, task, url, params):
-        if task.manager.options.test:
-            self.log.info('Not submitting to trakt.tv because of test mode.')
-            return
-        prm = json.dumps(params)
-        self.log.debug('Submitting data to trakt.tv (%s): %s' % (url, prm))
-        try:
-            result = task.requests.post(url, data=prm, raise_status=False)
-        except RequestException as e:
-            self.log.error('Error submitting data to trakt.tv: %s' % e)
-            return
-        if result.status_code == 404:
-            # Remove some info from posted json and print the rest to aid debugging
-            for key in ['username', 'password', 'episodes']:
-                params.pop(key, None)
-            self.log.warning('Some movie/show is unknown to trakt.tv: %s' % params)
-        elif result.status_code == 401:
-            self.log.error('Authentication error: check your trakt.tv username/password/api_key')
-            self.log.debug(result.text)
-        elif result.status_code != 200:
-            self.log.error('Error submitting data to trakt.tv: %s' % result.text)
-        else:
-            self.log.info('Data successfully sent to trakt.tv: ' + result.text)
-    
     @plugin.priority(-255)
     def on_task_output(self, task, config):
-        """Finds accepted movies and submits them to the user trakt watchlist."""
-        config['password'] = hashlib.sha1(config['password']).hexdigest()
-        # Don't edit the config, or it won't pass validation on rerun
-        url_params = config.copy()
-        url_params['data_type'] = 'list'
-        # Do some translation from visible list name to prepare for use in url
-        list_name = config['list'].lower()
-        # These characters are just stripped in the url
-        for char in '!@#$%^*()[]{}/=?+\\|_':
-            list_name = list_name.replace(char, '')
-        # These characters get replaced
-        list_name = list_name.replace('&', 'and')
-        list_name = list_name.replace(' ', '-')
-        url_params['list_type'] = list_name
-        # Sort out the data
-        found = {'shows': {}, 'movies': {}}
+        """Submits accepted movies or episodes to trakt api."""
+        if config.get('account') and not config.get('username'):
+            config['username'] = 'me'
+        found = {'shows': [], 'movies': []}
         for entry in task.accepted:
-            serie = None
-            if entry.get('tvdb_id'):
-                serie = found['shows'].setdefault(entry['tvdb_id'], 
-                                                  {'tvdb_id': entry['tvdb_id']})
-            elif entry.get('series_name'):
-                serie = found['shows'].setdefault(entry['series_name'].lower(), 
-                                                  {'title': entry['series_name'].lower()})
-            elif entry.get('imdb_id'):
-                found['movies'].setdefault(entry['imdb_id'], 
-                                           {'imdb_id': entry['imdb_id']})
-            elif entry.get('tmdb_id'):
-                found['movies'].setdefault(entry['tmdb_id'], 
-                                           {'tmdb_id': entry['tmdb_id']})
-            elif entry.get('movie_name') and entry.get('movie_year'):
-                found['movies'].setdefault(entry['movie_name'].lower(), 
-                                           {'title': entry['movie_name'], 
-                                            'year': entry['movie_year']})
-            if serie:
-                if entry.get('series_season') and entry.get('series_episode'):
-                    serie.setdefault('episodes', []).append({'season': entry['series_season'], 
-                                                             'episode': entry['series_episode']})
-                else:
-                    serie['whole'] = True
+            if config['type'] in ['auto', 'shows', 'seasons', 'episodes'] and entry.get('series_name') is not None:
+                show = {'title': entry['series_name'], 'ids': get_entry_ids(entry)}
+                if config['type'] in ['auto', 'seasons', 'episodes'] and entry.get('series_season') is not None:
+                    season = {'number': entry['series_season']}
+                    if config['type'] in ['auto', 'episodes'] and entry.get('series_episode') is not None:
+                        season['episodes'] = [{'number': entry['series_episode']}]
+                    show['seasons'] = [season]
+                if config['type'] in ['seasons', 'episodes'] and 'seasons' not in show:
+                    self.log.debug('Not submitting `%s`, no season found.' % entry['title'])
+                    continue
+                if config['type'] == 'episodes' and 'episodes' not in show:
+                    self.log.debug('Not submitting `%s`, no episode number found.' % entry['title'])
+                    continue
+                found['shows'].append(show)
+            elif config['type'] in ['auto', 'movies']:
+                movie = {'ids': get_entry_ids(entry)}
+                if not movie['ids']:
+                    if entry.get('movie_name') is not None:
+                        movie['title'] = entry.get('movie_name') or entry.get('imdb_name')
+                        movie['year'] = entry.get('movie_year') or entry.get('imdb_year')
+                    else:
+                        self.log.debug('Not submitting `%s`, no movie name or id found.' % entry['title'])
+                        continue
+                found['movies'].append(movie)
+
         if not (found['shows'] or found['movies']):
             self.log.debug('Nothing to submit to trakt.')
             return
-        # Make the calls
-        if not list_name in ['watchlist', 'seen', 'library']:
-            post_params = {'username': config['username'], 
-                           'password': config['password'], 
-                           'slug': list_name, 'items': []}
-            for item in found['movies'].itervalues():    
-                data = {'type': 'movie'}
-                data.update(item)
-                post_params['items'].append(data)
-            for item in found['shows'].itervalues():
-                if 'whole' in item:
-                    data = {'type': 'show'}
-                    data.update(item)
-                    del data['whole']
-                    if 'episodes' in data:
-                        del data['episodes']
-                    post_params['items'].append(data)
-                else:
-                    for epi in item['episodes']:
-                        data = {'type': 'episode'}
-                        data.update(item)
-                        data.update(epi)
-                        del data['episodes']
-                        post_params['items'].append(data)
-            post_url = 'http://api.trakt.tv/lists/items/%s/%s' % \
-                ('delete' if self.remove else 'add', config['api_key'])
-            self.submit_data(task, post_url, post_params)
+
+        if config['list'] in ['collection', 'watchlist', 'watched']:
+            args = ('sync', 'history' if config['list'] == 'watched' else config['list'])
         else:
-            base_params = {'username': config['username'], 'password': config['password']}
+            args = ('users', config['username'], 'lists', make_list_slug(config['list']), 'items')
+        if self.remove:
+            args += ('remove', )
+        url = get_api_url(args)
+
+        if task.manager.options.test:
+            self.log.info('Not submitting to trakt.tv because of test mode.')
+            return
+        session = get_session(account=config.get('account'))
+        self.log.debug('Submitting data to trakt.tv (%s): %s' % (url, found))
+        try:
+            result = session.post(url, data=json.dumps(found), raise_status=False)
+        except RequestException as e:
+            self.log.error('Error submitting data to trakt.tv: %s' % e)
+            return
+        if 200 <= result.status_code < 300:
+            action = 'added'
             if self.remove:
-                list_name = 'un' + list_name
-            post_params = {'movies': []}
-            post_params.update(base_params)
-            for item in found['movies'].itervalues():
-                post_params['movies'].append(item)
-            if post_params['movies']:
-                post_url = 'http://api.trakt.tv/movie/%s/%s' % (list_name, config['api_key'])
-                self.submit_data(task, post_url, post_params)
-            for item in found['shows'].itervalues():
-                if item.get('whole'):
-                    post_params = item.copy()
-                    post_params.update(base_params)
-                    del post_params['whole']
-                    if 'episodes' in post_params:
-                        del post_params['episodes']
-                    post_url = 'http://api.trakt.tv/show/%s/%s' % (list_name, config['api_key'])
-                    self.submit_data(task, post_url, post_params)
-                else:
-                    post_params = {'episodes': item['episodes']}
-                    post_params.update(base_params)
-                    post_params.update(item)
-                    post_url = 'http://api.trakt.tv/show/episode/%s/%s' % (list_name, config['api_key'])
-                    self.submit_data(task, post_url, post_params)
+                action = 'deleted'
+            res = result.json()
+            movies = res[action].get('movies', 0)
+            shows = res[action].get('shows', 0)
+            eps = res[action].get('episodes', 0)
+            self.log.info('Successfully %s to/from list %s: %s movie(s), %s show(s), %s episode(s).',
+                          action, config['list'], movies, shows, eps)
+            for k, r in res['not_found'].iteritems():
+                if r:
+                    self.log.debug('not found %s: %s' % (k, r))
+            # TODO: Improve messages about existing and unknown results
+        elif result.status_code == 404:
+            self.log.error('List does not appear to exist on trakt: %s' % config['list'])
+        elif result.status_code == 401:
+            self.log.error('Authentication error: have you authorized Flexget on Trakt.tv?')
+            self.log.debug('trakt response: ' + result.text)
+        else:
+            self.log.error('Unknown error submitting data to trakt.tv: %s' % result.text)
 
 
 class TraktAdd(TraktSubmit):

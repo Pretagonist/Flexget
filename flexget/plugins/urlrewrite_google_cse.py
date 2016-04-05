@@ -7,7 +7,7 @@ import urlparse
 from flexget import plugin
 from flexget.event import event
 from flexget.plugins.plugin_urlrewriting import UrlRewritingError
-from flexget.utils.requests import Session
+from flexget.utils.requests import Session, TimedLimiter
 from flexget.utils.soup import get_soup
 from flexget.utils.tools import urlopener
 
@@ -15,7 +15,7 @@ log = logging.getLogger('google')
 
 requests = Session()
 requests.headers.update({'User-Agent': 'Mozilla/4.0 (compatible; MSIE 5.5; Windows NT)'})
-requests.set_domain_delay('imdb.com', '2 seconds')
+requests.add_domain_limiter(TimedLimiter('imdb.com', '2 seconds'))
 
 
 class UrlRewriteGoogleCse(object):
@@ -77,7 +77,7 @@ class UrlRewriteGoogle(object):
             # import IPython; IPython.embed()
             # import sys
             # sys.exit(1)
-            #href = link['href'].lstrip('/url?q=').split('&')[0]
+            # href = link['href'].lstrip('/url?q=').split('&')[0]
 
             # Test if entry with this url would be recognized by some urlrewriter
             log.trace('Checking if %s is known by some rewriter' % href)

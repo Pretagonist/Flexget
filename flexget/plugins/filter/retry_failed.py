@@ -1,4 +1,5 @@
 from __future__ import unicode_literals, division, absolute_import
+
 import logging
 from datetime import datetime, timedelta
 
@@ -9,8 +10,8 @@ from flexget import db_schema, options, plugin
 from flexget.event import event
 from flexget.logger import console
 from flexget.manager import Session
+from flexget.utils.sqlalchemy_utils import table_add_column
 from flexget.utils.tools import parse_timedelta
-from flexget.utils.sqlalchemy_utils import table_add_column, table_schema
 
 SCHEMA_VER = 3
 
@@ -20,16 +21,8 @@ Base = db_schema.versioned_base('failed', SCHEMA_VER)
 
 @db_schema.upgrade('failed')
 def upgrade(ver, session):
-    if ver is None:
-        # add count column
-        table_add_column('failed', 'count', Integer, session, default=1)
-        ver = 0
-    if ver == 0:
-        # define an index
-        log.info('Adding database index ...')
-        failed = table_schema('failed', session)
-        Index('failed_title_url', failed.c.title, failed.c.url, failed.c.count).create()
-        ver = 1
+    if ver is None or ver < 1:
+        raise db_schema.UpgradeImpossible
     if ver == 1:
         table_add_column('failed', 'reason', Unicode, session)
         ver = 2
@@ -59,9 +52,35 @@ class FailedEntry(Base):
     def __str__(self):
         return '<Failed(title=%s)>' % self.title
 
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'url': self.url,
+            'added_at': self.tof,
+            'reason': self.reason,
+            'count': self.count,
+            'retry_time': self.retry_time
+        }
+
+
 # create indexes, used when creating tables
 columns = Base.metadata.tables['failed'].c
 Index('failed_title_url', columns.title, columns.url, columns.count)
+
+
+@event('manager.db_cleanup')
+def db_cleanup(manager, session):
+    # Delete everything older than 30 days
+    session.query(FailedEntry).filter(FailedEntry.tof < datetime.now() - timedelta(days=30)).delete()
+    # Of the remaining, always keep latest 25. Drop any after that if fail was more than a week ago.
+    keep_num = 25
+    keep_ids = [fe.id for fe in session.query(FailedEntry).order_by(FailedEntry.tof.desc())[:keep_num]]
+    if len(keep_ids) == keep_num:
+        query = session.query(FailedEntry)
+        query = query.filter(FailedEntry.id.notin_(keep_ids))
+        query = query.filter(FailedEntry.tof < datetime.now() - timedelta(days=7))
+        query.delete(synchronize_session=False)
 
 
 class PluginFailed(object):
@@ -120,16 +139,19 @@ class PluginFailed(object):
 
     @plugin.priority(-255)
     def on_task_input(self, task, config):
+        if config is False:
+            return
         config = self.prepare_config(config)
         for entry in task.all_entries:
             entry.on_fail(self.add_failed, config=config)
 
     def add_failed(self, entry, reason=None, config=None, **kwargs):
         """Adds entry to internal failed list, displayed with --failed"""
-        reason = reason or 'Unknown'
+        # Make sure reason is a string, in case it is set to an exception instance
+        reason = unicode(reason) or 'Unknown'
         with Session() as session:
             # query item's existence
-            item = session.query(FailedEntry).filter(FailedEntry.title == entry['title']).\
+            item = session.query(FailedEntry).filter(FailedEntry.title == entry['title']). \
                 filter(FailedEntry.url == entry['original_url']).first()
             if not item:
                 item = FailedEntry(entry['title'], entry['original_url'], reason)
@@ -144,9 +166,6 @@ class PluginFailed(object):
             if self.backlog and item.count <= config['max_retries']:
                 self.backlog.instance.add_backlog(entry.task, entry, amount=retry_time, session=session)
             entry.task.rerun()
-            # limit item number to 25
-            for row in session.query(FailedEntry).order_by(FailedEntry.tof.desc())[25:]:
-                session.delete(row)
 
     @plugin.priority(255)
     def on_task_filter(self, task, config):
@@ -155,7 +174,7 @@ class PluginFailed(object):
         config = self.prepare_config(config)
         max_count = config['max_retries']
         for entry in task.entries:
-            item = task.session.query(FailedEntry).filter(FailedEntry.title == entry['title']).\
+            item = task.session.query(FailedEntry).filter(FailedEntry.title == entry['title']). \
                 filter(FailedEntry.url == entry['original_url']).first()
             if item:
                 if item.count > max_count:
@@ -201,6 +220,7 @@ def clear_failed(manager):
 @event('plugin.register')
 def register_plugin():
     plugin.register(PluginFailed, 'retry_failed', builtin=True, api_ver=2)
+
 
 @event('options.register')
 def register_parser_arguments():

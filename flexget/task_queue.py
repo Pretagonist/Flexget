@@ -4,6 +4,10 @@ import logging
 import Queue
 import threading
 import time
+from datetime import datetime
+
+
+from sqlalchemy.exc import ProgrammingError, OperationalError
 
 from flexget.task import TaskAbort
 
@@ -20,6 +24,8 @@ class TaskQueue(object):
         self._shutdown_now = False
         self._shutdown_when_finished = False
 
+        self.current_task = None
+
         # We don't override `threading.Thread` because debugging this seems unsafe with pydevd.
         # Overriding __len__(self) seems to cause a debugger deadlock.
         self._thread = threading.Thread(target=self.run, name='task_queue')
@@ -29,29 +35,33 @@ class TaskQueue(object):
         self._thread.start()
 
     def run(self):
-        try:
-            while not self._shutdown_now:
-                # Grab the first job from the run queue and do it
-                try:
-                    task = self.run_queue.get(timeout=0.5)
-                except Queue.Empty:
-                    if self._shutdown_when_finished:
-                        self._shutdown_now = True
-                    continue
-                try:
-                    task.execute()
-                except TaskAbort as e:
-                    log.debug('task %s aborted: %r' % (task.name, e))
-                finally:
-                    self.run_queue.task_done()
-            remaining_jobs = self.run_queue.qsize()
-            if remaining_jobs:
-                log.warning('task queue shut down with %s tasks remaining in the queue to run.' % remaining_jobs)
-        except:
-            log.exception('BUG: Unhandled exception during task_queue run loop.')
-            raise
-        finally:
-            log.debug('task_queue run loop ended')
+        while not self._shutdown_now:
+            # Grab the first job from the run queue and do it
+            try:
+                self.current_task = self.run_queue.get(timeout=0.5)
+            except Queue.Empty:
+                if self._shutdown_when_finished:
+                    self._shutdown_now = True
+                continue
+            try:
+                self.current_task.execute()
+            except TaskAbort as e:
+                log.debug('task %s aborted: %r' % (self.current_task.name, e))
+            except (ProgrammingError, OperationalError):
+                log.critical('Database error while running a task. Attempting to recover.')
+                self.current_task.manager.crash_report()
+            except Exception:
+                log.critical('BUG: Unhandled exception during task queue run loop.')
+                self.current_task.manager.crash_report()
+            finally:
+                self.run_queue.task_done()
+                self.current_task = None
+
+        remaining_jobs = self.run_queue.qsize()
+        if remaining_jobs:
+            log.warning('task queue shut down with %s tasks remaining in the queue to run.' % remaining_jobs)
+        else:
+            log.debug('task queue shut down')
 
     def is_alive(self):
         return self._thread.is_alive()
@@ -73,8 +83,8 @@ class TaskQueue(object):
         if finish_queue:
             self._shutdown_when_finished = True
             if self.run_queue.qsize():
-                log.info('There are %s tasks executing. Shutdown will commence when they have completed.' %
-                         self.run_queue.qsize())
+                log.verbose('There are %s tasks to execute. Shutdown will commence when they have completed.' %
+                            self.run_queue.qsize())
         else:
             self._shutdown_now = True
 

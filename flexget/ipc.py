@@ -35,21 +35,25 @@ class RemoteStream(object):
         self.writer = writer
 
     def write(self, data):
-        if not self.writer:
-            return
         # This relies on all data up to a newline being either unicode or str, not mixed
         if not self.buffer:
             self.buffer = data
         else:
             self.buffer += data
         newline = b'\n' if isinstance(self.buffer, str) else '\n'
-        while newline in self.buffer:
-            line, self.buffer = self.buffer.split(newline, 1)
-            try:
-                self.writer(line)
-            except EOFError:
-                self.writer = None
-                log.error('Client ended connection while still streaming output.')
+        if newline in self.buffer:
+            self.flush()
+
+    def flush(self):
+        if self.buffer is None or self.writer is None:
+            return
+        try:
+            self.writer(self.buffer, end='')
+        except EOFError:
+            self.writer = None
+            log.error('Client ended connection while still streaming output.')
+        finally:
+            self.buffer = None
 
 
 class DaemonService(rpyc.Service):
@@ -61,13 +65,14 @@ class DaemonService(rpyc.Service):
 
     def exposed_handle_cli(self, args):
         args = rpyc.utils.classic.obtain(args)
+        log.verbose('Running command `%s` for client.' % ' '.join(args))
         parser = get_parser()
         try:
-            options = parser.parse_args(args, raise_errors=True)
-        except ParserError as e:
-            # Recreate the normal error text to the client's console
-            self.client_console('error: ' + e.message)
-            e.parser.print_help(self.client_out_stream)
+            options = parser.parse_args(args, file=self.client_out_stream)
+        except SystemExit as e:
+            if e.code:
+                # TODO: Not sure how to properly propagate the exit code back to client
+                log.debug('Parsing cli args caused system exit with status %s.' % e.code)
             return
         if not options.cron:
             with capture_output(self.client_out_stream, loglevel=options.loglevel):
@@ -94,8 +99,8 @@ class ClientService(rpyc.Service):
     def exposed_version(self):
         return IPC_VERSION
 
-    def exposed_console(self, text):
-        console(text)
+    def exposed_console(self, text, *args, **kwargs):
+        console(text, *args, **kwargs)
 
 
 class IPCServer(threading.Thread):
@@ -105,7 +110,7 @@ class IPCServer(threading.Thread):
         self.manager = manager
         self.host = '127.0.0.1'
         self.port = port or 0
-        self.password = ''.join(random.choice(string.letters + string.digits) for x in range(15))
+        self.password = ''.join(random.choice(string.ascii_letters + string.digits) for x in range(15))
         self.server = None
 
     def authenticator(self, sock):
@@ -118,9 +123,13 @@ class IPCServer(threading.Thread):
         return sock, self.password
 
     def run(self):
+        # Make the rpyc logger a bit quieter when we aren't in debugging.
+        rpyc_logger = logging.getLogger('ipc.rpyc')
+        if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
+            rpyc_logger.setLevel(logging.WARNING)
         DaemonService.manager = self.manager
         self.server = ThreadedServer(
-            DaemonService, hostname=self.host, port=self.port, authenticator=self.authenticator, logger=log
+            DaemonService, hostname=self.host, port=self.port, authenticator=self.authenticator, logger=rpyc_logger
         )
         # If we just chose an open port, write save the chosen one
         self.port = self.server.listener.getsockname()[1]
@@ -128,7 +137,8 @@ class IPCServer(threading.Thread):
         self.server.start()
 
     def shutdown(self):
-        self.server.close()
+        if self.server:
+            self.server.close()
 
 
 class IPCClient(object):

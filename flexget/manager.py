@@ -10,30 +10,29 @@ import shutil
 import signal
 import sys
 import threading
+import traceback
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
-import pkg_resources
 import sqlalchemy
 import yaml
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import SingletonThreadPool
 
 # These need to be declared before we start importing from other flexget modules, since they might import them
 from flexget.utils.sqlalchemy_utils import ContextSession
+
 Base = declarative_base()
 Session = sessionmaker(class_=ContextSession)
 
-from flexget import config_schema, db_schema, logger, plugin
-from flexget.event import fire_event
-from flexget.ipc import IPCClient, IPCServer
-from flexget.options import CoreArgumentParser, get_parser, manager_parser, ParserError, unicode_argv
-from flexget.task import Task
-from flexget.task_queue import TaskQueue
-from flexget.utils.tools import pid_exists
-
+from flexget import config_schema, db_schema, logger, plugin  # noqa
+from flexget.event import fire_event  # noqa
+from flexget.ipc import IPCClient, IPCServer  # noqa
+from flexget.options import CoreArgumentParser, get_parser, manager_parser, ParserError, unicode_argv  # noqa
+from flexget.task import Task  # noqa
+from flexget.task_queue import TaskQueue  # noqa
+from flexget.utils.tools import pid_exists, get_current_flexget_version  # noqa
 
 log = logging.getLogger('manager')
 
@@ -41,23 +40,7 @@ manager = None
 DB_CLEANUP_INTERVAL = timedelta(days=7)
 
 
-@sqlalchemy.event.listens_for(Session, 'before_commit')
-def before_commit(session):
-    if not manager.has_lock and session.dirty:
-        log.debug('BUG?: Database writes should not be tried when there is no database lock.')
-
-
-@sqlalchemy.event.listens_for(sqlalchemy.engine.Engine, 'connect')
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    # There were reported db problems with WAL mode on XFS filesystem, which is sticky and may have been turned
-    # on with certain FlexGet versions (e2c118e) #2749
-    cursor.execute('PRAGMA journal_mode=delete')
-    cursor.close()
-
-
 class Manager(object):
-
     """Manager class for FlexGet
 
     Fires events:
@@ -93,6 +76,10 @@ class Manager(object):
       If any plugins have declared a newer schema version than exists in the database, this event will be fired to
       allow plugins to upgrade their tables
 
+    * manager.shutdown_requested
+
+      When shutdown has been requested. Any plugins which might add to execution queue should stop when this is fired.
+
     * manager.shutdown
 
       When the manager is exiting
@@ -113,8 +100,11 @@ class Manager(object):
         """
         :param args: CLI args
         """
-        global manager
-        assert not manager, 'Only one instance of Manager should be created at a time!'
+        if not self.unit_test:
+            global manager
+            assert not manager, 'Only one instance of Manager should be created at a time!'
+        else:
+            log.info('last manager was not torn down correctly')
 
         if args is None:
             # Decode all arguments to unicode before parsing
@@ -137,11 +127,17 @@ class Manager(object):
 
         self.config = {}
 
-        try:
-            self.options, extra = CoreArgumentParser().parse_known_args(args)
-        except ParserError:
-            # If a non-built-in command was used, we need to parse with a parser that doesn't define the subparsers
-            self.options, extra = manager_parser.parse_known_args(args)
+        if '--help' in args or '-h' in args:
+            # TODO: This is a bit hacky, but we can't call parse on real arguments when --help is used because it will
+            # cause a system exit before plugins are loaded and print incomplete help. This will get us a default
+            # options object and we'll parse the real args later, or send them to daemon. #2807
+            self.options, extra = CoreArgumentParser().parse_known_args(['execute'])
+        else:
+            try:
+                self.options, extra = CoreArgumentParser().parse_known_args(args)
+            except ParserError:
+                # If a non-built-in command was used, we need to parse with a parser that doesn't define the subparsers
+                self.options, extra = manager_parser.parse_known_args(args)
         try:
             self.find_config(create=False)
         except:
@@ -152,6 +148,7 @@ class Manager(object):
             # If an absolute path is not specified, use the config directory.
             if not os.path.isabs(log_file):
                 log_file = os.path.join(self.config_base, log_file)
+
             logger.start(log_file, self.options.loglevel.upper(), to_console=not self.options.cron)
 
         manager = self
@@ -176,7 +173,7 @@ class Manager(object):
         if self.initialized:
             raise RuntimeError('Cannot call initialize on an already initialized manager.')
 
-        plugin.load_plugins()
+        plugin.load_plugins(extra_dirs=[os.path.join(self.config_base, 'plugins')])
 
         # Reparse CLI options now that plugins are loaded
         self.options = get_parser().parse_args(self.args)
@@ -216,7 +213,7 @@ class Manager(object):
     def has_lock(self):
         return self._has_lock
 
-    def execute(self, options=None, output=None, priority=1):
+    def execute(self, options=None, output=None, loglevel=None, priority=1):
         """
         Run all (can be limited with options) tasks from the config.
 
@@ -237,27 +234,31 @@ class Manager(object):
         task_names = self.tasks
         # Handle --tasks
         if options.tasks:
-            # Create list of tasks to run, preserving order
-            task_names = []
-            for arg in options.tasks:
-                matches = [t for t in self.tasks if fnmatch.fnmatchcase(unicode(t).lower(), arg.lower())]
-                if not matches:
-                    msg = '`%s` does not match any tasks' % arg
-                    log.error(msg)
-                    if output:
-                        output.write(msg)
-                    continue
-                task_names.extend(m for m in matches if m not in task_names)
-            # Set the option as a list of matching task names so plugins can use it easily
-            options.tasks = task_names
+            # Consider * the same as not specifying tasks at all (makes sure manual plugin still works)
+            if options.tasks == ['*']:
+                options.tasks = None
+            else:
+                # Create list of tasks to run, preserving order
+                task_names = []
+                for arg in options.tasks:
+                    matches = [t for t in self.tasks if fnmatch.fnmatchcase(unicode(t).lower(), arg.lower())]
+                    if not matches:
+                        msg = '`%s` does not match any tasks' % arg
+                        log.error(msg)
+                        if output:
+                            output.write(msg)
+                        continue
+                    task_names.extend(m for m in matches if m not in task_names)
+                # Set the option as a list of matching task names so plugins can use it easily
+                options.tasks = task_names
         # TODO: 1.2 This is a hack to make task priorities work still, not sure if it's the best one
         task_names = sorted(task_names, key=lambda t: self.config['tasks'][t].get('priority', 65535))
 
         finished_events = []
         for task_name in task_names:
-            task = Task(self, task_name, options=options, output=output, priority=priority)
+            task = Task(self, task_name, options=options, output=output, loglevel=loglevel, priority=priority)
             self.task_queue.put(task)
-            finished_events.append(task.finished_event)
+            finished_events.append((task.id, task.name, task.finished_event))
         return finished_events
 
     def start(self):
@@ -268,11 +269,15 @@ class Manager(object):
         and results will be streamed back.
         If not, this will attempt to obtain a lock, initialize the manager, and run the command here.
         """
+        # When we are in test mode, we use a different lock file and db
+        if self.options.test:
+            self.lockfile = os.path.join(self.config_base, '.test-%s-lock' % self.config_name)
         # If another process is started, send the execution to the running process
         ipc_info = self.check_ipc_info()
         if ipc_info:
+            logger.console('There is a FlexGet process already running for this config, sending execution there.')
+            log.debug('Sending command to running FlexGet process: %s' % self.args)
             try:
-                log.info('There is a FlexGet process already running for this config, sending execution there.')
                 client = IPCClient(ipc_info['port'], ipc_info['password'])
             except ValueError as e:
                 log.error(e)
@@ -285,6 +290,13 @@ class Manager(object):
                 except EOFError:
                     log.error('Connection from daemon was severed.')
             return
+        if self.options.test:
+            log.info('Test mode, creating a copy from database ...')
+            db_test_filename = os.path.join(self.config_base, 'test-%s.sqlite' % self.config_name)
+            if os.path.exists(self.db_filename):
+                shutil.copy(self.db_filename, db_test_filename)
+                log.info('Test database created')
+            self.db_filename = db_test_filename
         # No running process, we start our own to handle command
         with self.acquire_lock():
             self.initialize()
@@ -297,7 +309,6 @@ class Manager(object):
 
         * :meth:`.execute_command`
         * :meth:`.daemon_command`
-        * :meth:`.webui_command`
         * CLI plugin callback function
 
         The manager should have a lock and be initialized before calling this method.
@@ -307,18 +318,16 @@ class Manager(object):
         if not options:
             options = self.options
         command = options.cli_command
-        options = getattr(options, command)
+        command_options = getattr(options, command)
         # First check for built-in commands
-        if command in ['execute', 'daemon', 'webui']:
+        if command in ['execute', 'daemon']:
             if command == 'execute':
-                self.execute_command(options)
+                self.execute_command(command_options)
             elif command == 'daemon':
-                self.daemon_command(options)
-            elif command == 'webui':
-                self.webui_command(options)
+                self.daemon_command(command_options)
         else:
             # Otherwise dispatch the command to the callback function
-            options.cli_command_callback(self, options)
+            options.cli_command_callback(self, command_options)
 
     def execute_command(self, options):
         """
@@ -338,10 +347,11 @@ class Manager(object):
         if self.task_queue.is_alive():
             if len(self.task_queue):
                 log.verbose('There is a task already running, execution queued.')
-            finished_events = self.execute(options, output=logger.get_output())
+            finished_events = self.execute(options, output=logger.get_capture_stream(),
+                                           loglevel=logger.get_capture_loglevel())
             if not options.cron:
                 # Wait until execution of all tasks has finished
-                for event in finished_events:
+                for task_id, task_name, event in finished_events:
                     event.wait()
         else:
             self.task_queue.start()
@@ -362,9 +372,14 @@ class Manager(object):
 
         :param options: argparse options
         """
+
+        # Import API so it can register to daemon.started event
         if options.action == 'start':
             if self.is_daemon:
                 log.error('Daemon already running for this config.')
+                return
+            elif self.task_queue.is_alive():
+                log.error('Non-daemon execution of FlexGet is running. Cannot start daemon until it is finished.')
                 return
             if options.daemonize:
                 self.daemonize()
@@ -387,6 +402,8 @@ class Manager(object):
             if options.action == 'status':
                 log.info('Daemon running. (PID: %s)' % os.getpid())
             elif options.action == 'stop':
+                tasks = 'all queued tasks (if any) have' if options.wait else 'currently running task (if any) has'
+                log.info('Daemon shutdown requested. Shutdown will commence when %s finished executing.' % tasks)
                 self.shutdown(options.wait)
             elif options.action == 'reload':
                 log.info('Reloading config from disk.')
@@ -396,32 +413,6 @@ class Manager(object):
                     log.error('Error loading config: %s' % e.args[0])
                 else:
                     log.info('Config successfully reloaded from disk.')
-
-    def webui_command(self, options):
-        """
-        Handles the 'webui' CLI command.
-
-        :param options: argparse options
-        """
-        if self.is_daemon:
-            log.error('Webui or daemon is already running.')
-            return
-        # TODO: make webui an enablable plugin in regular daemon mode
-        try:
-            pkg_resources.require('flexget[webui]')
-        except pkg_resources.DistributionNotFound as e:
-            log.error('Dependency not met. %s' % e)
-            log.error('Webui dependencies not installed. You can use `pip install flexget[webui]` to install them.')
-            self.shutdown()
-            return
-        if options.daemonize:
-            self.daemonize()
-        self.is_daemon = True
-        from flexget.ui import webui
-        self.task_queue.start()
-        self.ipc_server.start()
-        webui.start(self)
-        self.task_queue.wait()
 
     def _handle_sigterm(self, signum, frame):
         log.info('Got SIGTERM. Shutting down.')
@@ -434,6 +425,7 @@ class Manager(object):
             # Override the default string handling function
             # to always return unicode objects
             return self.construct_scalar(node)
+
         yaml.Loader.add_constructor(u'tag:yaml.org,2002:str', construct_yaml_str)
         yaml.SafeLoader.add_constructor(u'tag:yaml.org,2002:str', construct_yaml_str)
 
@@ -441,13 +433,14 @@ class Manager(object):
         def unicode_representer(dumper, uni):
             node = yaml.ScalarNode(tag=u'tag:yaml.org,2002:str', value=uni)
             return node
+
         yaml.add_representer(unicode, unicode_representer)
 
         # Set up the dumper to increase the indent for lists
         def increase_indent_wrapper(func):
-
             def increase_indent(self, flow=False, indentless=False):
                 func(self, flow, False)
+
             return increase_indent
 
         yaml.Dumper.increase_indent = increase_indent_wrapper(yaml.Dumper.increase_indent)
@@ -516,6 +509,7 @@ class Manager(object):
         self.config_name = os.path.splitext(os.path.basename(config))[0]
         self.config_base = os.path.normpath(os.path.dirname(config))
         self.lockfile = os.path.join(self.config_base, '.%s-lock' % self.config_name)
+        self.db_filename = os.path.join(self.config_base, 'db-%s.sqlite' % self.config_name)
 
     def load_config(self):
         """
@@ -544,7 +538,7 @@ class Manager(object):
             print(' o Indentation error')
             print(' o Missing : from end of the line')
             print(' o Non ASCII characters (use UTF8)')
-            print(' o If text contains any of :[]{}% characters it must be single-quoted ' \
+            print(' o If text contains any of :[]{}% characters it must be single-quoted '
                   '(eg. value{1} should be \'value{1}\')\n')
 
             # Not very good practice but we get several kind of exceptions here, I'm not even sure all of them
@@ -586,6 +580,7 @@ class Manager(object):
 
         :raises: `ValueError` and rolls back to previous config if the provided config is not valid.
         """
+        new_user_config = config
         old_config = self.config
         try:
             self.config = self.validate_config(config)
@@ -596,17 +591,20 @@ class Manager(object):
             self.config = old_config
             raise
         log.debug('New config data loaded.')
+        self.user_config = copy.deepcopy(new_user_config)
         fire_event('manager.config_updated', self)
 
     def save_config(self):
         """Dumps current config to yaml config file"""
+        # TODO: Only keep x number of backups..
+
         # Back up the user's current config before overwriting
         backup_path = os.path.join(self.config_base,
                                    '%s-%s.bak' % (self.config_name, datetime.now().strftime('%y%m%d%H%M%S')))
         log.debug('backing up old config to %s before new save' % backup_path)
         shutil.copy(self.config_path, backup_path)
         with open(self.config_path, 'w') as config_file:
-            config_file.write(yaml.dump(self.config, default_flow_style=False))
+            config_file.write(yaml.dump(self.user_config, default_flow_style=False))
 
     def config_changed(self):
         """Makes sure that all tasks will have the config_modified flag come out true on the next run.
@@ -614,6 +612,7 @@ class Manager(object):
         from flexget.task import config_changed
         for task in self.tasks:
             config_changed(task)
+        fire_event('manager.config_updated', self)
 
     def validate_config(self, config=None):
         """
@@ -635,7 +634,6 @@ class Manager(object):
         else:
             return config
 
-
     def init_sqlalchemy(self):
         """Initialize SQLAlchemy"""
         try:
@@ -647,17 +645,6 @@ class Manager(object):
 
         # SQLAlchemy
         if self.database_uri is None:
-            self.db_filename = os.path.join(self.config_base, 'db-%s.sqlite' % self.config_name)
-            if self.options.test:
-                db_test_filename = os.path.join(self.config_base, 'test-%s.sqlite' % self.config_name)
-                log.info('Test mode, creating a copy from database ...')
-                if os.path.exists(self.db_filename):
-                    shutil.copy(self.db_filename, db_test_filename)
-                self.db_filename = db_test_filename
-                # Different database, different lock file
-                self.lockfile = os.path.join(self.config_base, '.test-%s-lock' % self.config_name)
-                log.info('Test database created')
-
             # in case running on windows, needs double \\
             filename = self.db_filename.replace('\\', '\\\\')
             self.database_uri = 'sqlite:///%s' % filename
@@ -670,7 +657,6 @@ class Manager(object):
         try:
             self.engine = sqlalchemy.create_engine(self.database_uri,
                                                    echo=self.options.debug_sql,
-                                                   poolclass=SingletonThreadPool,
                                                    connect_args={'check_same_thread': False, 'timeout': 10})
         except ImportError:
             print('FATAL: Unable to use SQLite. Are you running Python 2.5 - 2.7 ?\n'
@@ -849,7 +835,7 @@ class Manager(object):
             log.info('Running database cleanup.')
             session = Session()
             try:
-                fire_event('manager.db_cleanup', session)
+                fire_event('manager.db_cleanup', self, session)
                 session.commit()
             finally:
                 session.close()
@@ -867,20 +853,38 @@ class Manager(object):
         """
         if not self.initialized:
             raise RuntimeError('Cannot shutdown manager that was never initialized.')
+        fire_event('manager.shutdown_requested', self)
         self.task_queue.shutdown(finish_queue)
 
     def _shutdown(self):
         """Runs when the manager is done processing everything."""
+        if self.ipc_server:
+            self.ipc_server.shutdown()
         fire_event('manager.shutdown', self)
         if not self.unit_test:  # don't scroll "nosetests" summary results when logging is enabled
             log.debug('Shutting down')
         self.engine.dispose()
         # remove temporary database used in test mode
         if self.options.test:
-            if not 'test' in self.db_filename:
+            if 'test' not in self.db_filename:
                 raise Exception('trying to delete non test database?')
             if self._has_lock:
                 os.remove(self.db_filename)
                 log.info('Removed test database')
-        if not self.unit_test:  # don't scroll "nosetests" summary results when logging is enabled
-            log.debug('Shutdown completed')
+
+    def crash_report(self):
+        """
+        This should be called when handling an unexpected exception. Will create a new log file containing the last 50
+        debug messages as well as the crash traceback.
+        """
+        if not self.unit_test:
+            filename = os.path.join(self.config_base, datetime.now().strftime('crash_report.%Y.%m.%d.%H%M%S%f.log'))
+            with codecs.open(filename, 'w', encoding='utf-8') as outfile:
+                outfile.writelines(logger.debug_buffer)
+                traceback.print_exc(file=outfile)
+            log.critical('An unexpected crash has occurred. Writing crash report to %s. '
+                         'Please verify you are running the latest version of flexget by using "flexget -V" '
+                         'from CLI or by using version_checker plugin'
+                         ' at http://flexget.com/wiki/Plugins/version_checker. You are currently using'
+                         ' version %s', filename, get_current_flexget_version())
+        log.debug('Traceback:', exc_info=True)
